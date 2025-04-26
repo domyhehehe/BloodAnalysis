@@ -11,7 +11,6 @@
 #include <mutex>
 #include <unordered_set>
 
-
 // Windows関係のヘッダをインクルードする前にこれを書く
 #define NOMINMAX
 #include <windows.h>
@@ -39,8 +38,9 @@ namespace fs = std::filesystem;
 static const string UNKNOWN_SIRE = "UNKNOWN_SIRE";
 static const string UNKNOWN_DAM = "UNKNOWN_DAM";
 
-
-// (オプション) メモリ使用量をモニタリングしたい場合
+//--------------------------------------------------------------------
+// メモリ使用量を取得 (任意)
+//--------------------------------------------------------------------
 size_t getMemoryUsageMB() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX pmc;
@@ -50,7 +50,6 @@ size_t getMemoryUsageMB() {
     }
     return 0;
 #elif __linux__
-    // Linuxの場合
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
         return usage.ru_maxrss / 1024; // KB→MB
@@ -74,8 +73,8 @@ struct Horse {
 };
 
 // 全馬データ
-unordered_map<string, Horse> horses;
-unordered_map<string, string> keyToDisplayName;
+unordered_map<string, Horse> horses;            // pk => Horse構造体
+unordered_map<string, string> keyToDisplayName; // pk => "馬名 [年]"
 
 //--------------------------------------------------------------------
 // CSV行を(カンマ区切り+クォート対応)で分割
@@ -174,8 +173,7 @@ rocksdb::DB* g_db = nullptr;
 // Value: doubleをシリアライズしたバイナリ
 //--------------------------------------------------------------------
 inline string makeKey(const string& target, const string& ancestor) {
-    // シンプルに "target|ancestor" という文字列にする
-    return target + "|" + ancestor;
+    return target + "|" + ancestor;  // "target|ancestor"
 }
 
 inline string serializeDouble(double val) {
@@ -191,7 +189,7 @@ inline double deserializeDouble(const string& bin) {
 
 //--------------------------------------------------------------------
 // RocksDBから (target, ancestor) の値を取得
-//    見つからなければ optional<double>() を返す (C++17なら optional)
+//    成功なら outVal に代入し true
 //--------------------------------------------------------------------
 inline bool getValueFromDB(const string& target,
     const string& ancestor,
@@ -222,26 +220,28 @@ inline void putValueToDB(const string& target,
 }
 
 //--------------------------------------------------------------------
-// 血量計算 (RocksDBにキャッシュ)  - dp廃止
+// 血量計算 (RocksDBにキャッシュ) - 通常版 (target→ancestor)
+//   - すでにあるならDBから読み取り
+//   - なければ計算してDBに書き込み
 //--------------------------------------------------------------------
-double getBloodPercentageMemo(const string& target,
+double getBloodPercentageMemo_normal(const string& target,
     const string& ancestor,
     unordered_set<string>& inStack)
 {
-    // 1) RocksDBにデータがあれば即リターン
+    // 1) RocksDBにキャッシュあり？
     double cachedVal;
     if (getValueFromDB(target, ancestor, cachedVal)) {
         return cachedVal;
     }
 
-    // 2) horsesにない or UNKNOWN_* => 0
+    // 2) horsesにない or UNKNOWN => 0
     if (target == UNKNOWN_SIRE || target == UNKNOWN_DAM ||
         !horses.count(target)) {
         putValueToDB(target, ancestor, 0.0);
         return 0.0;
     }
 
-    // 3) 同一 => 1.0
+    // 3) 同じ馬 => 1.0
     if (target == ancestor) {
         putValueToDB(target, ancestor, 1.0);
         return 1.0;
@@ -254,40 +254,85 @@ double getBloodPercentageMemo(const string& target,
     }
     inStack.insert(target);
 
-    // 5) 父・母を辿る再帰
+    // 5) 再帰計算(父・母)
     const Horse& h = horses[target];
-    double val = 0.5 * getBloodPercentageMemo(h.Sire, ancestor, inStack)
-        + 0.5 * getBloodPercentageMemo(h.Dam, ancestor, inStack);
+    double val = 0.5 * getBloodPercentageMemo_normal(h.Sire, ancestor, inStack)
+        + 0.5 * getBloodPercentageMemo_normal(h.Dam, ancestor, inStack);
 
     inStack.erase(target);
-
-    // 6) RocksDBに保存
     putValueToDB(target, ancestor, val);
     return val;
 }
 
 //--------------------------------------------------------------------
-// 行列形式CSV出力
-//   行=rowKeys, 列=colKeys
-//   "HorseName, col1, col2, ..."
+// 血量計算 (RocksDBにキャッシュ) - 逆版 (ancestor→target)
+//   - すでにあるならDBから読み取り
+//   - なければ計算してDBに書き込み
 //--------------------------------------------------------------------
-void saveCSVMatrix_NoExtra(const string& filename,
+double getBloodPercentageMemo_reversed(const string& ancestor,
+    const string& target,
+    unordered_set<string>& inStack)
+{
+    // 同じく RocksDB のキーは (ancestor, target) とする
+    double cachedVal;
+    if (getValueFromDB(ancestor, target, cachedVal)) {
+        return cachedVal;
+    }
+
+    // horsesにない or UNKNOWN => 0
+    if (ancestor == UNKNOWN_SIRE || ancestor == UNKNOWN_DAM ||
+        !horses.count(ancestor)) {
+        putValueToDB(ancestor, target, 0.0);
+        return 0.0;
+    }
+
+    // 同じ馬 => 1.0
+    if (ancestor == target) {
+        putValueToDB(ancestor, target, 1.0);
+        return 1.0;
+    }
+
+    // 循環防止
+    if (inStack.count(ancestor)) {
+        putValueToDB(ancestor, target, 0.0);
+        return 0.0;
+    }
+    inStack.insert(ancestor);
+
+    // 再帰 (子孫を辿る形は本来複雑だが、ここでは単に親とみなして計算する例)
+    // あなたの用途に応じてロジックが違う場合あり。
+    // ここでは便宜上 "ancestorの父・母" => "ancestorの祖先" という扱いを反転
+    // (実際の血統上は "逆探索" なので慎重に設計する必要がある)
+    const Horse& ancHorse = horses[ancestor];
+    double val = 0.5 * getBloodPercentageMemo_reversed(ancHorse.Sire, target, inStack)
+        + 0.5 * getBloodPercentageMemo_reversed(ancHorse.Dam, target, inStack);
+
+    inStack.erase(ancestor);
+    putValueToDB(ancestor, target, val);
+    return val;
+}
+
+//--------------------------------------------------------------------
+// 行列形式CSV出力 (通常版:  row=allKeys, col=subset )
+//   val = getBloodPercentageMemo_normal(row, col)
+//--------------------------------------------------------------------
+void saveCSVMatrix_Normal(const string& filename,
     const vector<string>& rowKeys,
     const vector<string>& colKeys)
 {
     if (colKeys.empty()) {
-        cout << "[saveCSVMatrix_NoExtra] skip because colKeys empty\n";
+        cout << "[saveCSVMatrix_Normal] skip because colKeys empty\n";
         return;
     }
 
     ofstream ofs(filename);
     if (!ofs.is_open()) {
-        cerr << "[saveCSVMatrix_NoExtra] cannot open " << filename << endl;
+        cerr << "[saveCSVMatrix_Normal] cannot open " << filename << endl;
         return;
     }
     ofs << fixed << setprecision(8);
 
-    // ヘッダ
+    // ヘッダ行
     ofs << "HorseName";
     for (auto& ck : colKeys) {
         ofs << "," << keyToDisplayName[ck];
@@ -299,42 +344,112 @@ void saveCSVMatrix_NoExtra(const string& filename,
         const string& rk = rowKeys[i];
         size_t memUsage = getMemoryUsageMB();
 
-        cout << "[計算中] " << (i + 1) << "/" << rowKeys.size()
+        cout << "[通常版計算中] " << (i + 1) << "/" << rowKeys.size()
             << ": " << keyToDisplayName[rk]
             << " (Mem=" << memUsage << "MB)"
                 << endl;
 
             ofs << keyToDisplayName[rk];
 
-            // 列ループ
             for (auto& ck : colKeys) {
                 unordered_set<string> inStack;
-                double val = getBloodPercentageMemo(rk, ck, inStack);
+                double val = getBloodPercentageMemo_normal(rk, ck, inStack);
                 if (fabs(val) < 1e-12) val = 0.0;
                 ofs << "," << val;
             }
             ofs << "\n";
     }
     ofs.close();
-
-    cout << "[saveCSVMatrix_NoExtra] " << filename << " 出力完了\n";
+    cout << "[saveCSVMatrix_Normal] " << filename << " 出力完了\n";
 }
 
 //--------------------------------------------------------------------
-// メイン (RocksDBを使用し、dp廃止バージョン)
+// 行列形式CSV出力 (逆版: row=allKeys, col=subset )
+//   val = getBloodPercentageMemo_reversed(col, row)
+//--------------------------------------------------------------------
+void saveCSVMatrix_Reversed(const string& filename,
+    const vector<string>& rowKeys,
+    const vector<string>& colKeys)
+{
+    if (colKeys.empty()) {
+        cout << "[saveCSVMatrix_Reversed] skip because colKeys empty\n";
+        return;
+    }
+
+    ofstream ofs(filename);
+    if (!ofs.is_open()) {
+        cerr << "[saveCSVMatrix_Reversed] cannot open " << filename << endl;
+        return;
+    }
+    ofs << fixed << setprecision(8);
+
+    // ヘッダ行
+    ofs << "HorseName";
+    for (auto& ck : colKeys) {
+        ofs << "," << keyToDisplayName[ck];
+    }
+    ofs << "\n";
+
+    // 本文
+    for (size_t i = 0; i < rowKeys.size(); i++) {
+        const string& rk = rowKeys[i];
+        size_t memUsage = getMemoryUsageMB();
+
+        cout << "[逆版計算中] " << (i + 1) << "/" << rowKeys.size()
+            << ": " << keyToDisplayName[rk]
+            << " (Mem=" << memUsage << "MB)"
+                << endl;
+
+            ofs << keyToDisplayName[rk];
+
+            for (auto& ck : colKeys) {
+                unordered_set<string> inStack;
+                double val = getBloodPercentageMemo_reversed(ck, rk, inStack);
+                if (fabs(val) < 1e-12) val = 0.0;
+                ofs << "," << val;
+            }
+            ofs << "\n";
+    }
+    ofs.close();
+    cout << "[saveCSVMatrix_Reversed] " << filename << " 出力完了\n";
+}
+
+//--------------------------------------------------------------------
+// 年代区分 (0~1800, 1801~1850, 1851~1900, 1901~1950, 1951~2000, 2001~ )
+//--------------------------------------------------------------------
+string getYearBucket(int y) {
+    if (y == INT_MIN || y <= 1800) {
+        return "0_1800";
+    }
+    else if (y <= 1850) {
+        return "1801_1850";
+    }
+    else if (y <= 1900) {
+        return "1851_1900";
+    }
+    else if (y <= 1950) {
+        return "1901_1950";
+    }
+    else if (y <= 2000) {
+        return "1951_2000";
+    }
+    else {
+        return "2001_";
+    }
+}
+
+//--------------------------------------------------------------------
+// メイン
 //--------------------------------------------------------------------
 int main()
 {
-
-
-    std::cout << "現在の実行ディレクトリ: " << std::filesystem::current_path() << std::endl;
+    cout << "現在の実行ディレクトリ: " << fs::current_path() << endl;
 
     try {
-        // 1) 血統データCSV読み込み
-        loadBloodlineCSV("C:\\Users\\user\\source\\repos\\BloodAnalysis\\BloodAnalysis\\BloodAnalysis\\bloodline.csv");
+        // 1) 血統データCSV読み込み (絶対パス or 相対パス)
+        loadBloodlineCSV("D:/AI/C++/blood_cache_db");
 
-
-        // 2) RocksDBオープン
+        // 2) RocksDBオープン (データ永続化)
         {
             rocksdb::Options options;
             options.create_if_missing = true;
@@ -360,33 +475,36 @@ int main()
 
         cout << "[main] allKeys.size()=" << allKeys.size() << endl;
 
-        // 4) 年代区分に分割 (例)
-        vector<string> subset_0_1800;
-        vector<string> subset_1801_1900;
-        vector<string> subset_1901_2000;
-        vector<string> subset_2001;
+        // 4) 50年刻みで年代区分に分割
+        //    (  0_1800, 1801_1850, 1851_1900, 1901_1950, 1951_2000, 2001_ )
+        //    各区分 => vector<string> subset
+        unordered_map<string, vector<string>> subsets;
 
         for (auto& k : allKeys) {
             int y = horses[k].YearInt;
-            if (y == INT_MIN || y <= 1800) {
-                subset_0_1800.push_back(k);
-            }
-            else if (y <= 1900) {
-                subset_1801_1900.push_back(k);
-            }
-            else if (y <= 2000) {
-                subset_1901_2000.push_back(k);
-            }
-            else {
-                subset_2001.push_back(k);
-            }
+            string bucket = getYearBucket(y); // 50年区切り
+            subsets[bucket].push_back(k);
         }
 
-        // 5) 行列形式でCSV出力
-        saveCSVMatrix_NoExtra("blood_percentage_0_1800.csv", allKeys, subset_0_1800);
-        saveCSVMatrix_NoExtra("blood_percentage_1801_1900.csv", allKeys, subset_1801_1900);
-        saveCSVMatrix_NoExtra("blood_percentage_1901_2000.csv", allKeys, subset_1901_2000);
-        saveCSVMatrix_NoExtra("blood_percentage_2001.csv", allKeys, subset_2001);
+        // 例： subsets["0_1800"], subsets["1801_1850"], ... subsets["2001_"]
+
+        // 5) それぞれ (通常版, 逆版) の行列出力
+        //   ex) "blood_percentage_0_1800_normal.csv", "blood_percentage_0_1800_reversed.csv"
+        for (auto& kv : subsets) {
+            const string& bucketName = kv.first;           // "0_1800" etc
+            const vector<string>& bucketKeys = kv.second; // その年代に属する馬
+
+            // 行=allKeys, 列=bucketKeys (通常版)
+            {
+                string fname = "D:/AI/C++/out/blood_percentage_" + bucketName + "_normal.csv";
+                saveCSVMatrix_Normal(fname, allKeys, bucketKeys);
+            }
+            // 行=allKeys, 列=bucketKeys (逆版)
+            {
+                string fname = "D:/AI/C++/out/blood_percentage_" + bucketName + "_reversed.csv";
+                saveCSVMatrix_Reversed(fname, allKeys, bucketKeys);
+            }
+        }
 
         // 6) RocksDBをクローズ
         delete g_db;
