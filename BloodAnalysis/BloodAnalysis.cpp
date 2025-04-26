@@ -447,13 +447,13 @@ int main()
 
     try {
         // 1) 血統データCSV読み込み (絶対パス or 相対パス)
-        loadBloodlineCSV("D:/AI/C++/blood_cache_db");
+        loadBloodlineCSV("D:\\AI\\C++\\input\\bloodline.csv");
 
         // 2) RocksDBオープン (データ永続化)
         {
             rocksdb::Options options;
             options.create_if_missing = true;
-            rocksdb::Status s = rocksdb::DB::Open(options, "blood_cache_db", &g_db);
+            rocksdb::Status s = rocksdb::DB::Open(options, "D:/AI/C++/blood_cache_db", &g_db);
             if (!s.ok()) {
                 cerr << "[RocksDB] Open error: " << s.ToString() << endl;
                 return 1;
